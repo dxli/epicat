@@ -49,7 +49,6 @@ default_lang = "en"
 # asr_model = ""                       # path to a whisper ggml-*.bin
 
 [audio]
-# dub_duck_db = -11.0                  # how far the original ducks under the dub
 # dub_max_speedup = 1.35               # cap on compressing a line into its slot
 # codec = "aac"
 # bitrate = "192k"

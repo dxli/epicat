@@ -69,9 +69,7 @@ class AudioConfig:
     channels: int = 2
     codec: str = "aac"
     bitrate: str = "192k"
-    # English dub mixing
-    dub_duck_db: float = -11.0        # how far the original is pushed down under speech
-    dub_gain_db: float = 1.0
+    # English dub timing (the dub track carries dubbed speech only -- see dub.py)
     dub_max_speedup: float = 1.5      # cap on time-compressing a long line into its slot
     dub_min_speedup: float = 0.85
     dub_fit_rounds: int = 3           # measure-and-correct passes when fitting lines

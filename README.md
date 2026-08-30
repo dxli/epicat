@@ -193,9 +193,9 @@ neighbours — which matters for Chinese, where the subject is often left out.
 
 Each translated line is then synthesised, measured, and re-synthesised faster if
 it would run into the next line. The result is laid onto a silent timeline at the
-cue's own start time, and mixed with the original through a sidechain compressor
-keyed on the speech, so music and effects stay audible and duck only under
-dialogue.
+cue's own start time. The dubbed track carries dubbed speech and silence, nothing
+else — the original-language audio is never mixed into it, since a player picking
+a track by its language tag expects to hear only that language.
 
 ## Options
 
@@ -265,7 +265,6 @@ translate_model = "translategemma:27b"
 tts_backend = "auto"
 
 [audio]
-dub_duck_db = -11.0
 dub_max_speedup = 1.35
 
 [video]

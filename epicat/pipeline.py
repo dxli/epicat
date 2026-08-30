@@ -299,12 +299,17 @@ class Pipeline:
 
     # -------------------------------------------------------------------- dub
 
-    def dub(self, target_cues: Sequence[Cue], source_audio: Path,
-            total: float) -> Path | None:
+    def dub(self, target_cues: Sequence[Cue], total: float) -> Path | None:
+        """Synthesise the dubbed track: dubbed speech and silence, nothing else.
+
+        The original-language audio is never mixed in here -- a player picking
+        this track by its language tag expects to hear only that language, not
+        the dub laid over the original dialogue.
+        """
         cfg = self.cfg.text
-        mixed = self.work / f"audio.{cfg.target_lang}.wav"
-        if not self.stale("dub") and mixed.exists():
-            return mixed
+        out_wav = self.work / f"audio.{cfg.target_lang}.wav"
+        if not self.stale("dub") and out_wav.exists():
+            return out_wav
         backend = tts_mod.build(cfg)
         if backend is None or not target_cues:
             return None
@@ -314,10 +319,8 @@ class Pipeline:
         if not clips:
             self.warn("speech synthesis produced nothing; no dubbed track")
             return None
-        speech = self.work / f"speech.{cfg.target_lang}.wav"
-        dub_mod.assemble(target_cues, clips, speech, total, self.cfg.audio)
-        dub_mod.mix_with_original(speech, source_audio, mixed, self.cfg.audio)
-        return mixed
+        dub_mod.assemble(target_cues, clips, out_wav, total, self.cfg.audio)
+        return out_wav
 
     # ------------------------------------------------------------------- main
 
@@ -341,7 +344,7 @@ class Pipeline:
         write_vtt(Path(f"{stem}.{cfg.text.source_lang}.vtt"), src_cues)
         write_vtt(Path(f"{stem}.{cfg.text.target_lang}.vtt"), tgt_cues)
 
-        dubbed = self.dub(tgt_cues, source_audio, total)
+        dubbed = self.dub(tgt_cues, total)
 
         audio_tracks = [Track(source_audio, cfg.text.source_lang,
                               track_title(cfg.text.source_lang, "(original)"))]

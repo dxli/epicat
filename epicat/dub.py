@@ -128,28 +128,3 @@ def assemble(cues: Sequence[Cue], clips: dict[int, Path], out_wav: Path,
     _write_wav(out_wav, canvas[:int(round(total * rate))], rate, 1)
 
 
-def mix_with_original(speech: Path, original: Path, out_path: Path,
-                      acfg: AudioConfig) -> None:
-    """Duck the original under the dub so music and effects survive.
-
-    A sidechain compressor keyed on the speech track lowers the original only
-    while someone is talking, which sounds far better than a flat gain cut.
-    """
-    duck = 10 ** (acfg.dub_duck_db / 20.0)
-    gain = 10 ** (acfg.dub_gain_db / 20.0)
-    ratio = max(1.0 / max(duck, 1e-3), 1.5)
-    filt = (
-        f"[1:a]aformat=channel_layouts=stereo,volume={gain:.4f}[speech];"
-        f"[speech]asplit=2[sc][mix];"
-        f"[0:a]aformat=channel_layouts=stereo[orig];"
-        f"[orig][sc]sidechaincompress=threshold=0.03:ratio={min(ratio, 20):.2f}"
-        f":attack=20:release=350:makeup=1[ducked];"
-        f"[ducked][mix]amix=inputs=2:duration=first:normalize=0,"
-        f"alimiter=limit=0.97[out]"
-    )
-    with atomic_output(out_path) as tmp:
-        run(["ffmpeg", "-v", "error", "-nostdin", "-y",
-             "-i", str(original), "-i", str(speech),
-             "-filter_complex", filt, "-map", "[out]",
-             "-ar", str(acfg.sample_rate), "-ac", str(acfg.channels),
-             "-c:a", "pcm_s16le", str(tmp)])

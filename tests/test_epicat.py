@@ -666,5 +666,50 @@ class TestPipelineEmptySubtitles(unittest.TestCase):
             self.assertGreater(out.stat().st_size, 0)
 
 
+class TestDubTrackIsSpeechOnly(unittest.TestCase):
+    """A player selecting the dub track by its language tag must hear only
+    that language: the original-language audio must never be mixed in."""
+
+    def test_mix_with_original_no_longer_exists(self):
+        # A direct regression guard: this function used to duck-and-mix the
+        # original audio into the dub track, which is exactly the bug being
+        # fixed here. Its reintroduction, even unused, would be a red flag.
+        import epicat.dub as dub_mod
+        self.assertFalse(hasattr(dub_mod, "mix_with_original"))
+
+    def test_assemble_output_is_silent_outside_dubbed_lines(self):
+        from epicat.config import AudioConfig
+        from epicat.dub import assemble
+        with tempfile.TemporaryDirectory() as d:
+            # A short synthetic "dub line": a 1kHz tone, standing in for TTS
+            # output so the test needs no network or TTS backend.
+            clip = Path(d) / "line.wav"
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+                           "-i", "sine=frequency=1000:duration=0.5",
+                           "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", str(clip)],
+                          check=True)
+            cues = [Cue(2.0, 3.0, "hello")]
+            out = Path(d) / "speech.wav"
+            assemble(cues, {0: clip}, out, total=5.0, acfg=AudioConfig())
+
+            proc = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", str(out), "-f", "s16le", "-"],
+                capture_output=True, check=True)
+            samples = np.frombuffer(proc.stdout, dtype="<i2").astype(np.float64)
+            rate = 48000
+            before = samples[:int(1.5 * rate)]   # well before the cue starts
+            during = samples[int(2.1 * rate):int(2.4 * rate)]  # inside it
+            self.assertLess(np.abs(before).max(), 50)   # silence, not just quiet
+            self.assertGreater(np.abs(during).max(), 1000)  # the tone is actually there
+
+    def test_pipeline_dub_does_not_touch_the_original_audio(self):
+        # dub() used to take source_audio and mix it in; the new signature
+        # has nothing to mix, by construction.
+        import inspect
+        from epicat.pipeline import Pipeline
+        params = list(inspect.signature(Pipeline.dub).parameters)
+        self.assertEqual(params, ["self", "target_cues", "total"])
+
+
 if __name__ == "__main__":
     unittest.main()
