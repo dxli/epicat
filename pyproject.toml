@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "epicat"
+version = "1.0.0"
+description = "Join episode clips into one dual-language file: order by title-card episode number, drop repeated title cards, erase burnt-in captions, mux dual audio and subtitles."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24"]
+
+[project.scripts]
+epicat = "epicat.cli:main"
+
+[tool.setuptools]
+packages = ["epicat"]
+
+[tool.setuptools.package-data]
+epicat = []

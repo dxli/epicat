@@ -1,0 +1,60 @@
+# Example epicat configuration.
+#   python3 epicat.py -c epicat.example.toml
+# Every field here has a default; only override what you need. The commented
+# values are the defaults.
+
+inputs = [
+  "clips/ep-a.mp4",
+  "clips/ep-b.mp4",
+]
+output = "series.mp4"
+
+# Which audio and subtitle track players should select on their own.
+default_lang = "en"
+
+# workdir = "series.work"
+
+[title]
+# enabled = true
+# keep_first  = true    # keep episode 1's card, cut the rest
+# erase_margin = 8      # px added around the OCR box before painting it out
+# end_ratio = 0.08      # card ends when glyph contrast falls to this share of peak
+# max_seconds = 20.0
+
+[band]
+# Leave top/bottom unset (the default) to detect the caption band automatically.
+# top = 0.823
+# bottom = 0.907
+# min_px = 45           # glyph pixels needed to call a frame captioned
+# dilate = 2
+# shot_break_delta = 6.0
+# donor_match_tolerance = 9.0
+
+# Static overlays -- a watermark, a channel bug -- as fractions of the frame:
+# [x, y, width, height]. The overlay is found by what stays put across frames,
+# so semi-transparent ones work too. Off unless set.
+# extra_regions = [[0.72, 0.89, 0.28, 0.11]]
+# extra_persistence = 0.35
+
+[text]
+# source = "ocr"                       # ocr | asr | both
+# source_lang = "zh"
+# target_lang = "en"
+# translate_backend = "ollama"         # auto | ollama | passthrough | none
+# translate_model = "translategemma:27b"
+# translate_batch = 12
+# tts_backend = "auto"                 # auto | kokoro | say | none
+# tts_voice = ""                       # kokoro: af_heart, am_michael, bm_george…
+# ocr_sample_hz = 4.0
+# asr_model = ""                       # path to a whisper ggml-*.bin
+
+[audio]
+# dub_duck_db = -11.0                  # how far the original ducks under the dub
+# dub_max_speedup = 1.35               # cap on compressing a line into its slot
+# codec = "aac"
+# bitrate = "192k"
+
+[video]
+# codec = "libx264"                    # or h264_videotoolbox, libx265
+# crf = 17
+# preset = "medium"

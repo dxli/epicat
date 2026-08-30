@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# built on first use
+tools/macocr/macocr
+tools/kokoro/node_modules/
+tools/kokoro/models/
+
+# run output
+*.work/
