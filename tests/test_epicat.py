@@ -20,10 +20,11 @@ from epicat.cjk import chinese_to_int, find_episode, strip_episode
 from epicat.config import Config, TextConfig
 from epicat.imaging import (box_mean, dilate, grey_min, grow_mask, inpaint,
                             plate_fill, text_mask, tophat, write_png)
-from epicat.mux import iso3, track_title
+from epicat.mux import iso3, subtitle_codec, track_title
 from epicat.overlay import region_boxes
 from epicat.subs import Cue, read_srt, write_srt
 from epicat.translate import _parse_numbered, word_budgets
+from epicat.util import ToolError, atomic_output, human_time
 
 
 class TestChineseNumerals(unittest.TestCase):
@@ -246,8 +247,47 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(c.video.crf, 20)
 
     def test_unknown_key_is_rejected(self):
-        with self.assertRaises(KeyError):
+        # A raw KeyError/AttributeError would surface as an unhandled
+        # traceback in the CLI; ToolError is what cli.main() catches cleanly.
+        with self.assertRaises(ToolError):
             Config().apply_overrides({"band.nope": 1})
+
+    def test_unknown_top_level_section_is_rejected_cleanly(self):
+        # A typo'd section name walks a dotted path whose first segment does
+        # not exist at all -- that used to raise a raw AttributeError.
+        with self.assertRaises(ToolError):
+            Config().apply_overrides({"fooo.bar": "1"})
+
+    def test_malformed_int_is_rejected_cleanly(self):
+        with self.assertRaises(ToolError):
+            Config().apply_overrides({"video.crf": "abc"})
+
+    def test_malformed_bool_is_rejected_rather_than_silently_false(self):
+        with self.assertRaises(ToolError):
+            Config().apply_overrides({"title.keep_first": "treu"})
+
+    def test_optional_float_field_coerces_from_none_default(self):
+        # band.top / band.bottom default to None; coercion used to be driven
+        # by the *current* value's type, so a None default meant a "--set
+        # band.top=0.5" silently stored the string "0.5" instead of a float.
+        c = Config()
+        c.apply_overrides({"band.top": "0.5", "band.bottom": "0.9"})
+        self.assertEqual(c.band.top, 0.5)
+        self.assertIsInstance(c.band.top, float)
+        self.assertEqual(c.band.bottom, 0.9)
+        self.assertIsInstance(c.band.bottom, float)
+
+    def test_load_rejects_malformed_toml_cleanly(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "bad.toml"
+            p.write_text("this is not [ valid toml", encoding="utf-8")
+            with self.assertRaises(ToolError):
+                Config.load(str(p))
+
+    def test_load_rejects_missing_file_cleanly(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ToolError):
+                Config.load(str(Path(d) / "missing.toml"))
 
 
 class TestBootstrap(unittest.TestCase):
@@ -400,6 +440,230 @@ class TestCliBootstrapDispatch(unittest.TestCase):
             cli.main(["--bootstrap", "--only", "ffmpeg, node"])
         _, kwargs = run_bootstrap.call_args
         self.assertEqual(kwargs["only"], ["ffmpeg", "node"])
+
+    def test_bad_output_extension_is_rejected_before_any_work(self):
+        # A typo'd -o extension must not be discovered only at mux() -- the
+        # very last pipeline stage, after render/OCR/translate/dub already ran.
+        import epicat.cli as cli
+        with tempfile.TemporaryDirectory() as d:
+            clip = Path(d) / "a.mp4"
+            clip.write_bytes(b"\x00")
+            args = cli.build_parser().parse_args([str(clip), "-o", "out.avi"])
+            with self.assertRaises(ToolError):
+                cli.make_config(args)
+
+    def test_malformed_band_flag_is_rejected_cleanly(self):
+        import epicat.cli as cli
+        with tempfile.TemporaryDirectory() as d:
+            clip = Path(d) / "a.mp4"
+            clip.write_bytes(b"\x00")
+            for spec in ("not-a-number", "0.5"):  # missing colon, and bad numbers
+                args = cli.build_parser().parse_args(
+                    [str(clip), "-o", "out.mp4", "--band", spec])
+                with self.assertRaises(ToolError):
+                    cli.make_config(args)
+
+    def test_malformed_erase_region_is_rejected_cleanly(self):
+        import epicat.cli as cli
+        with tempfile.TemporaryDirectory() as d:
+            clip = Path(d) / "a.mp4"
+            clip.write_bytes(b"\x00")
+            args = cli.build_parser().parse_args(
+                [str(clip), "-o", "out.mp4", "--erase-region", "0.1,0.2,bad,0.4"])
+            with self.assertRaises(ToolError):
+                cli.make_config(args)
+
+
+class TestAtomicOutput(unittest.TestCase):
+    def test_publishes_on_success(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.mp4"
+            with atomic_output(p) as tmp:
+                self.assertNotEqual(tmp, p)
+                tmp.write_text("done")
+            self.assertEqual(p.read_text(), "done")
+            self.assertFalse(tmp.exists())
+
+    def test_discards_on_exception(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.mp4"
+            with self.assertRaises(RuntimeError):
+                with atomic_output(p) as tmp:
+                    tmp.write_text("partial")
+                    raise RuntimeError("boom")
+            self.assertFalse(p.exists())
+            self.assertFalse(tmp.exists())
+
+    def test_preserves_extension_for_format_sniffing(self):
+        # A temp name of "video.mp4.part" would make ffmpeg refuse to write
+        # it at all, since it infers the container from the trailing suffix.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "video.mp4"
+            with atomic_output(p) as tmp:
+                self.assertTrue(tmp.name.endswith(".mp4"))
+                self.assertNotEqual(tmp.suffix, ".part")
+                tmp.write_bytes(b"data")
+
+    def test_does_not_clobber_an_existing_file_on_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.srt"
+            p.write_text("original")
+            with self.assertRaises(RuntimeError):
+                with atomic_output(p) as tmp:
+                    tmp.write_text("new")
+                    raise RuntimeError("boom")
+            self.assertEqual(p.read_text(), "original")
+
+
+class TestHumanTime(unittest.TestCase):
+    def test_negative_duration_clamps_to_zero(self):
+        self.assertEqual(human_time(-5.0), "00:00:00.000")
+
+    def test_formats_hours_minutes_seconds(self):
+        self.assertEqual(human_time(3661.5), "01:01:01.500")
+
+
+class TestFfmpegProbeFps(unittest.TestCase):
+    def test_zero_over_zero_frame_rate_falls_back_instead_of_crashing(self):
+        # ffprobe reports avg_frame_rate="0/0" for many real streams
+        # (variable frame rate, short clips); Fraction("0/0") raises
+        # ZeroDivisionError outright, so this has to be caught before
+        # construction, not after a `== 0` check that never gets reached.
+        from fractions import Fraction
+        from epicat.ffmpeg import _safe_fps
+        self.assertEqual(_safe_fps("0/0", "25/1"), 25)
+        self.assertEqual(_safe_fps(None, "30/1"), 30)
+        self.assertEqual(_safe_fps("0/0", "0/0"), 25)   # both unusable -> hard fallback
+        self.assertEqual(_safe_fps("30000/1001", "25/1"), Fraction(30000, 1001))
+
+
+class TestConcatEscaping(unittest.TestCase):
+    def test_single_quote_in_filename_is_escaped(self):
+        from epicat.ffmpeg import _concat_escape
+        escaped = _concat_escape(Path("/tmp/clip's part 1.mp4"))
+        # The ffmpeg concat demuxer's own escaping: close the quote, insert
+        # an escaped quote, reopen -- exactly like POSIX shell quoting.
+        self.assertEqual(escaped, "/tmp/clip'\\''s part 1.mp4")
+        self.assertNotIn("''", escaped.replace("'\\''", ""))
+
+
+class TestInpaintDegenerateMask(unittest.TestCase):
+    def test_entirely_masked_region_is_left_untouched_not_blackened(self):
+        # Reachable via overlay detection's own "treat the whole box as
+        # overlay" fallback: with zero known pixels anywhere in reach, the
+        # old behaviour was to fabricate solid black instead of leaving the
+        # pixels alone.
+        region = np.full((40, 60, 3), 180, np.uint8)
+        mask = np.ones((40, 60), dtype=bool)
+        out = inpaint(region, mask)
+        self.assertTrue((out == region).all())
+
+
+class TestMuxSubtitleCodec(unittest.TestCase):
+    def test_known_containers(self):
+        self.assertEqual(subtitle_codec(".mp4"), "mov_text")
+        self.assertEqual(subtitle_codec(".mkv"), "srt")
+        self.assertEqual(subtitle_codec(".MOV"), "mov_text")
+
+    def test_unknown_container_is_rejected(self):
+        with self.assertRaises(ToolError):
+            subtitle_codec(".avi")
+
+
+class TestSrtParsingRobustness(unittest.TestCase):
+    def test_extra_arrow_on_timing_line_does_not_crash(self):
+        # A hand-edited SRT (README explicitly documents this as a supported
+        # resume workflow) with stray text left on the timing line used to
+        # raise "too many values to unpack" from a bare .split("-->").
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.srt"
+            p.write_text("1\n00:00:01,000 --> 00:00:02,000 --> stray\nhello\n",
+                         encoding="utf-8")
+            cues = read_srt(p)
+        self.assertEqual(len(cues), 1)
+        self.assertAlmostEqual(cues[0].start, 1.0)
+        self.assertAlmostEqual(cues[0].end, 2.0)
+
+
+class TestPipelineAsrFallback(unittest.TestCase):
+    """A missing ASR engine must not abort a run that never asked for ASR --
+    only a run that explicitly requested it with nothing else to fall back
+    on should propagate that failure."""
+
+    def _pipeline(self, tmpdir, source):
+        from epicat.config import Config
+        from epicat.pipeline import Pipeline
+        cfg = Config()
+        cfg.inputs = ["a.mp4"]
+        cfg.output = str(Path(tmpdir) / "out.mp4")
+        cfg.workdir = str(Path(tmpdir) / "work")
+        cfg.text.source = source
+        return Pipeline(cfg)
+
+    def test_ocr_only_default_does_not_crash_when_ocr_found_nothing(self):
+        import epicat.pipeline as pipeline_mod
+        with tempfile.TemporaryDirectory() as d:
+            pipe = self._pipeline(d, "ocr")
+            audio = Path(d) / "combined.wav"
+            audio.write_bytes(b"\x00")
+            with unittest.mock.patch.object(
+                    pipeline_mod.asr_mod, "build",
+                    side_effect=ToolError("whisper-cli not found")):
+                cues = pipe.source_cues(audio, from_ocr=[])
+            self.assertEqual(cues, [])
+            self.assertTrue(any("speech recognition unavailable" in w
+                               for w in pipe.warnings))
+
+    def test_both_mode_keeps_ocr_cues_when_asr_engine_is_missing(self):
+        import epicat.pipeline as pipeline_mod
+        with tempfile.TemporaryDirectory() as d:
+            pipe = self._pipeline(d, "both")
+            audio = Path(d) / "combined.wav"
+            audio.write_bytes(b"\x00")
+            ocr_cues = [Cue(0.0, 1.0, "hello")]
+            with unittest.mock.patch.object(
+                    pipeline_mod.asr_mod, "build",
+                    side_effect=ToolError("whisper-cli not found")):
+                cues = pipe.source_cues(audio, from_ocr=ocr_cues)
+            self.assertEqual([c.text for c in cues], ["hello"])
+
+    def test_explicit_asr_only_request_still_raises(self):
+        # cfg.source == "asr" with nothing else to fall back on: this is the
+        # one case where propagating the failure is correct, since the user
+        # asked for ASR specifically and there is no other source at all.
+        import epicat.pipeline as pipeline_mod
+        with tempfile.TemporaryDirectory() as d:
+            pipe = self._pipeline(d, "asr")
+            audio = Path(d) / "combined.wav"
+            audio.write_bytes(b"\x00")
+            with unittest.mock.patch.object(
+                    pipeline_mod.asr_mod, "build",
+                    side_effect=ToolError("whisper-cli not found")):
+                with self.assertRaises(ToolError):
+                    pipe.source_cues(audio, from_ocr=[])
+
+
+class TestPipelineEmptySubtitles(unittest.TestCase):
+    """Zero recovered cues must not produce a 0-byte .srt fed to mux() --
+    ffmpeg refuses to open an empty file as an input at all."""
+
+    def test_mux_accepts_zero_subtitle_tracks(self):
+        from epicat.mux import mux, Track
+        from epicat.config import AudioConfig
+        with tempfile.TemporaryDirectory() as d:
+            video = Path(d) / "v.mp4"
+            audio = Path(d) / "a.wav"
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+                           "-i", "color=c=blue:s=64x64:d=1:r=10",
+                           "-c:v", "libx264", "-crf", "30", "-an", str(video)], check=True)
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+                           "-i", "anullsrc=r=48000:cl=stereo", "-t", "1",
+                           "-c:a", "pcm_s16le", str(audio)], check=True)
+            out = Path(d) / "out.mp4"
+            mux(video, [Track(audio, "en", "English")], [], out,
+                default_lang="en", acfg=AudioConfig())
+            self.assertTrue(out.exists())
+            self.assertGreater(out.stat().st_size, 0)
 
 
 if __name__ == "__main__":

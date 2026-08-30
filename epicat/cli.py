@@ -104,6 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def make_config(args: argparse.Namespace) -> "Config":
     from .config import Config
+    from .mux import subtitle_codec
     cfg = Config.load(args.config)
     if args.inputs:
         cfg.inputs = [str(Path(i)) for i in args.inputs]
@@ -111,6 +112,10 @@ def make_config(args: argparse.Namespace) -> "Config":
         cfg.output = args.output
     if not cfg.inputs:
         raise ToolError("no input clips given")
+    # Checked once, up front: mux() only runs as the pipeline's last step, and
+    # a typo'd extension there would otherwise waste an entire render/OCR/
+    # translate/dub run before failing.
+    subtitle_codec(Path(cfg.output).suffix)
 
     if args.workdir:
         cfg.workdir = args.workdir
@@ -142,16 +147,24 @@ def make_config(args: argparse.Namespace) -> "Config":
     if args.no_dub:
         overrides["text.tts_backend"] = "none"
     if args.band:
-        top, _, bottom = args.band.partition(":")
-        overrides["band.top"] = float(top)
-        overrides["band.bottom"] = float(bottom)
+        top, sep, bottom = args.band.partition(":")
+        if not sep:
+            raise ToolError(f"--band expects TOP:BOTTOM, got {args.band!r}")
+        try:
+            overrides["band.top"] = float(top)
+            overrides["band.bottom"] = float(bottom)
+        except ValueError:
+            raise ToolError(f"--band expects two numbers, got {args.band!r}") from None
     if args.erase_region:
         regions = []
         for spec in args.erase_region:
             parts = [p.strip() for p in spec.replace(":", ",").split(",")]
             if len(parts) != 4:
                 raise ToolError(f"--erase-region expects X,Y,W,H, got {spec!r}")
-            regions.append([float(p) for p in parts])
+            try:
+                regions.append([float(p) for p in parts])
+            except ValueError:
+                raise ToolError(f"--erase-region expects four numbers, got {spec!r}") from None
         overrides["band.extra_regions"] = regions
 
     for item in args.set:

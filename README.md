@@ -278,8 +278,12 @@ See `epicat/config.py` for every field; each one is commented.
 ## Resuming
 
 Intermediates live in the work directory, and a stage is skipped when its output
-is already there. To redo part of a run — say the translation was poor, but the
-frame work was fine:
+is already there. Every one of those files is written to a temporary name and
+moved into place only once it is complete, so interrupting a run — Ctrl-C, a
+crash, a closed laptop lid — never leaves a partial file for the next run to
+mistake for a finished one; at worst you redo the one stage that was interrupted.
+
+To redo part of a run — say the translation was poor, but the frame work was fine:
 
 ```bash
 python3 epicat.py clips/*.mp4 -o series.mp4 --force-from translate

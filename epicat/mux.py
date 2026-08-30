@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .config import AudioConfig
-from .util import ToolError, log, run
+from .util import ToolError, atomic_output, log, run
 
 # ISO 639-2/B codes; QuickTime and most players want these three-letter tags.
 _ISO3 = {
@@ -16,6 +16,25 @@ _ISO3 = {
 
 _TITLES = {"en": "English", "zh": "中文", "zh-CN": "简体中文", "zh-TW": "繁體中文",
            "ja": "日本語", "ko": "한국어"}
+
+
+_SUB_CODEC_BY_CONTAINER = {".mkv": "srt", ".mp4": "mov_text", ".m4v": "mov_text",
+                          ".mov": "mov_text"}
+
+
+def subtitle_codec(container: str) -> str:
+    """The subtitle codec `container` (an extension, e.g. ".mp4") can carry.
+
+    Raises ToolError for anything unsupported, so an output path can be
+    validated before the pipeline does any work, not just when mux() finally
+    runs at the very end of a run.
+    """
+    codec = _SUB_CODEC_BY_CONTAINER.get(container.lower())
+    if codec is None:
+        raise ToolError(
+            f"unsupported output container: {container!r} "
+            f"(supported: {', '.join(sorted(_SUB_CODEC_BY_CONTAINER))})")
+    return codec
 
 
 def iso3(code: str) -> str:
@@ -51,13 +70,8 @@ def mux(video: Path, audio: Sequence[Track], subs: Sequence[Track], out: Path,
     audio = order(audio)
     subs = order(subs)
 
+    sub_codec = subtitle_codec(out.suffix)
     container = out.suffix.lower()
-    if container == ".mkv":
-        sub_codec = "srt"
-    elif container in (".mp4", ".m4v", ".mov"):
-        sub_codec = "mov_text"
-    else:
-        raise ToolError(f"unsupported output container: {out.suffix}")
 
     cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", str(video)]
     for t in list(audio) + list(subs):
@@ -89,8 +103,8 @@ def mux(video: Path, audio: Sequence[Track], subs: Sequence[Track], out: Path,
 
     if container in (".mp4", ".m4v", ".mov"):
         cmd += ["-movflags", "+faststart"]
-    cmd += [str(out)]
 
     log(f"muxing {len(audio)} audio and {len(subs)} subtitle tracks "
         f"(default: {default_lang}) → {out.name}")
-    run(cmd)
+    with atomic_output(out) as tmp:
+        run([*cmd, str(tmp)])

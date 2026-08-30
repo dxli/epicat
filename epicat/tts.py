@@ -81,8 +81,12 @@ class KokoroTts(TtsBackend):
             line = line.strip()
             if not line.startswith("{"):
                 continue
-            rec = json.loads(line)
-            if rec.get("ok"):
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                log(f"ignoring unparseable tts worker output: {line[:200]!r}", level="warn")
+                continue
+            if rec.get("ok") and rec.get("id") and rec.get("file"):
                 made[rec["id"]] = Path(rec["file"])
             else:
                 log(f"tts failed for {rec.get('id')}: {rec.get('error')}", level="warn")

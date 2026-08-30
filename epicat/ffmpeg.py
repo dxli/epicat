@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from fractions import Fraction
@@ -10,9 +11,30 @@ from typing import Iterator, Sequence
 
 import numpy as np
 
-from .util import ToolError, log, need, run, run_text
+from .util import ToolError, atomic_output, log, need, run, run_text
 
 BYTES_PER_PIXEL = {"rgb24": 3, "gray": 1}
+
+
+def _safe_fps(text: str | None, fallback: str) -> Fraction:
+    """Parse an ffprobe frame-rate string, falling back cleanly on "0/0".
+
+    ffprobe reports `avg_frame_rate=0/0` whenever it cannot determine an
+    average (common for variable-frame-rate or short streams) -- and
+    `Fraction("0/0")` raises `ZeroDivisionError` rather than parsing to 0, so
+    that case has to be caught before construction, not after.
+    """
+    text = text or fallback
+    try:
+        fps = Fraction(text)
+    except (ValueError, ZeroDivisionError):
+        fps = Fraction(0)
+    if fps == 0:
+        try:
+            fps = Fraction(fallback)
+        except (ValueError, ZeroDivisionError):
+            fps = Fraction(25, 1)
+    return fps
 
 
 @dataclass
@@ -44,9 +66,7 @@ def probe(path: str | Path) -> Media:
         raise ToolError(f"no video stream in {path}")
     a = next((s for s in data["streams"] if s.get("codec_type") == "audio"), None)
 
-    fps = Fraction(v.get("avg_frame_rate") or "0/0")
-    if fps == 0:
-        fps = Fraction(v.get("r_frame_rate") or "25/1")
+    fps = _safe_fps(v.get("avg_frame_rate"), v.get("r_frame_rate") or "25/1")
     duration = float(data["format"].get("duration") or v.get("duration") or 0.0)
 
     nb = v.get("nb_frames")
@@ -154,13 +174,26 @@ def read_frames_at(path: str | Path, width: int, height: int, indices: Sequence[
 
 
 class RawEncoder:
-    """Pipe raw rgb24 frames into an ffmpeg encoder."""
+    """Pipe raw rgb24 frames into an ffmpeg encoder.
+
+    Writes to a `.part` sibling of `path` and renames onto `path` only from
+    `close()`, which is meant to be called after every frame has been
+    written successfully. A process killed mid-encode -- or one whose caller
+    hits any other exception first -- must call `abort()` instead, never
+    `close()`: ffmpeg exiting 0 only means "muxed whatever it received
+    before its input closed", not "received everything it was meant to", so
+    treating a truncated stream as done would promote a short segment to the
+    trusted final filename.
+    """
 
     def __init__(self, path: str | Path, width: int, height: int, fps: Fraction,
                  *, vcodec: str = "libx264", crf: int = 17, preset: str = "medium",
                  pix_fmt: str = "yuv420p", extra: Sequence[str] = ()):
         need("ffmpeg")
-        self.path = str(path)
+        self.path = Path(path)
+        # Keep the real suffix at the end -- ffmpeg infers the container
+        # format from it, so "video.mp4.part" would refuse to open at all.
+        self.tmp_path = self.path.with_name(self.path.stem + ".part" + self.path.suffix)
         cmd = [
             "ffmpeg", "-v", "error", "-nostdin", "-y",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -172,21 +205,67 @@ class RawEncoder:
             cmd += ["-crf", str(crf), "-preset", preset]
         elif "videotoolbox" in vcodec:
             cmd += ["-q:v", str(max(1, min(100, 100 - crf * 2)))]
-        cmd += ["-pix_fmt", pix_fmt, *extra, self.path]
+        cmd += ["-pix_fmt", pix_fmt, *extra, str(self.tmp_path)]
         log("$ " + " ".join(cmd), level="debug")
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._done = False
 
     def write(self, frame: np.ndarray) -> None:
         assert self.proc.stdin is not None
-        self.proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+        try:
+            self.proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+        except (BrokenPipeError, OSError) as exc:
+            # The encoder died on its own -- a crash, a full disk, an
+            # unreadable frame. Report *why* instead of letting the raw pipe
+            # error surface with no context.
+            self._done = True
+            err = self.proc.stderr.read() if self.proc.stderr else b""
+            self.proc.wait()
+            self.tmp_path.unlink(missing_ok=True)
+            detail = err.decode("utf-8", "replace")[-2000:].strip() or str(exc)
+            raise ToolError(f"encoder died while writing frames: {detail}") from exc
 
     def close(self) -> None:
+        """Finish a *successful* encode: flush, wait, verify, and publish it."""
+        if self._done:
+            return
+        self._done = True
         assert self.proc.stdin is not None
-        self.proc.stdin.close()
+        try:
+            self.proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
         err = self.proc.stderr.read() if self.proc.stderr else b""
         rc = self.proc.wait()
         if rc != 0:
+            self.tmp_path.unlink(missing_ok=True)
             raise ToolError(f"encoder failed ({rc}): {err.decode('utf-8', 'replace')[-2000:]}")
+        os.replace(self.tmp_path, self.path)
+
+    def abort(self) -> None:
+        """Give up on this encode: stop ffmpeg and discard the partial output.
+
+        Call this instead of `close()` whenever the frame loop did not run to
+        completion, for any reason -- Ctrl-C, an unrelated exception, a caller
+        that simply changed its mind.
+        """
+        if self._done:
+            return
+        self._done = True
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=10)
+        except Exception:
+            pass
+        self.tmp_path.unlink(missing_ok=True)
 
     def __enter__(self) -> "RawEncoder":
         return self
@@ -195,10 +274,7 @@ class RawEncoder:
         if exc[0] is None:
             self.close()
         else:
-            try:
-                self.proc.kill()
-            except Exception:
-                pass
+            self.abort()
 
 
 def extract_audio(src: str | Path, dst: str | Path, *, start: float = 0.0,
@@ -206,19 +282,31 @@ def extract_audio(src: str | Path, dst: str | Path, *, start: float = 0.0,
                   channels: int = 2) -> None:
     """Decode a (sub)range of the source audio to WAV, or synthesise silence if there is none."""
     media = probe(src)
-    cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y"]
-    if media.has_audio:
-        if start:
-            cmd += ["-ss", f"{start:.6f}"]
-        cmd += ["-i", str(src)]
-        if duration is not None:
-            cmd += ["-t", f"{duration:.6f}"]
-        cmd += ["-map", "0:a:0"]
-    else:
-        cmd += ["-f", "lavfi", "-i", f"anullsrc=r={sample_rate}:cl={'stereo' if channels == 2 else 'mono'}"]
-        cmd += ["-t", f"{duration if duration is not None else media.duration:.6f}"]
-    cmd += ["-vn", "-ar", str(sample_rate), "-ac", str(channels), "-c:a", "pcm_s16le", str(dst)]
-    run(cmd)
+    with atomic_output(dst) as tmp:
+        cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y"]
+        if media.has_audio:
+            if start:
+                cmd += ["-ss", f"{start:.6f}"]
+            cmd += ["-i", str(src)]
+            if duration is not None:
+                cmd += ["-t", f"{duration:.6f}"]
+            cmd += ["-map", "0:a:0"]
+        else:
+            cmd += ["-f", "lavfi",
+                   "-i", f"anullsrc=r={sample_rate}:cl={'stereo' if channels == 2 else 'mono'}"]
+            cmd += ["-t", f"{duration if duration is not None else media.duration:.6f}"]
+        cmd += ["-vn", "-ar", str(sample_rate), "-ac", str(channels), "-c:a", "pcm_s16le", str(tmp)]
+        run(cmd)
+
+
+def _concat_escape(path: Path) -> str:
+    """Escape a path for the ffmpeg concat demuxer's quoted-line format.
+
+    Only the single quote is special once a field is single-quoted; the
+    standard trick is to close the quote, insert an escaped quote, and reopen
+    it, exactly as in POSIX shell quoting.
+    """
+    return str(path).replace("'", "'\\''")
 
 
 def concat_wavs(parts: Sequence[str | Path], dst: str | Path) -> None:
@@ -228,16 +316,20 @@ def concat_wavs(parts: Sequence[str | Path], dst: str | Path) -> None:
     for p in parts:
         inputs += ["-i", str(p)]
     filt = "".join(f"[{i}:a]" for i in range(len(parts))) + f"concat=n={len(parts)}:v=0:a=1[out]"
-    run(["ffmpeg", "-v", "error", "-nostdin", "-y", *inputs,
-         "-filter_complex", filt, "-map", "[out]", "-c:a", "pcm_s16le", str(dst)])
+    with atomic_output(dst) as tmp:
+        run(["ffmpeg", "-v", "error", "-nostdin", "-y", *inputs,
+             "-filter_complex", filt, "-map", "[out]", "-c:a", "pcm_s16le", str(tmp)])
 
 
 def concat_videos(parts: Sequence[str | Path], dst: str | Path, workdir: Path) -> None:
     """Concatenate segments that share codec parameters, without re-encoding."""
     listing = workdir / "concat_list.txt"
-    listing.write_text("".join(f"file '{Path(p).resolve()}'\n" for p in parts), encoding="utf-8")
-    run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0",
-         "-i", str(listing), "-c", "copy", "-an", str(dst)])
+    listing.write_text(
+        "".join(f"file '{_concat_escape(Path(p).resolve())}'\n" for p in parts),
+        encoding="utf-8")
+    with atomic_output(dst) as tmp:
+        run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0",
+             "-i", str(listing), "-c", "copy", "-an", str(tmp)])
 
 
 def audio_duration(path: str | Path) -> float:

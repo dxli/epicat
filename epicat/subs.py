@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .util import atomic_output
+
 
 @dataclass
 class Cue:
@@ -34,14 +36,16 @@ def write_srt(path: str | Path, cues: Sequence[Cue]) -> None:
     parts = []
     for i, c in enumerate(cues, 1):
         parts.append(f"{i}\n{_stamp(c.start)} --> {_stamp(c.end)}\n{c.text}\n")
-    Path(path).write_text("\n".join(parts), encoding="utf-8")
+    with atomic_output(path) as tmp:
+        tmp.write_text("\n".join(parts), encoding="utf-8")
 
 
 def write_vtt(path: str | Path, cues: Sequence[Cue]) -> None:
     parts = ["WEBVTT\n"]
     for c in cues:
         parts.append(f"{_stamp(c.start, '.')} --> {_stamp(c.end, '.')}\n{c.text}\n")
-    Path(path).write_text("\n".join(parts), encoding="utf-8")
+    with atomic_output(path) as tmp:
+        tmp.write_text("\n".join(parts), encoding="utf-8")
 
 
 _TS = re.compile(r"(\d+):(\d\d):(\d\d)[,.](\d{1,3})")
@@ -66,7 +70,9 @@ def read_srt(path: str | Path) -> list[Cue]:
             lines = lines[1:]
         if not lines or "-->" not in lines[0]:
             continue
-        left, right = lines[0].split("-->")
+        # maxsplit=1: a hand-edited file (this is a documented resume
+        # workflow) might leave stray text after the timestamps on that line.
+        left, _, right = lines[0].partition("-->")
         cues.append(Cue(_parse_stamp(left), _parse_stamp(right), "\n".join(lines[1:]).strip()))
     return cues
 

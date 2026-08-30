@@ -247,10 +247,24 @@ class Pipeline:
 
         cues = list(from_ocr)
         if cfg.source in ("asr", "both") or not cues:
+            attempting_asr_as_fallback = cfg.source != "asr"
             if cfg.source == "ocr" and not cues:
                 self.warn("no captions were recovered from the picture; "
                           "falling back to speech recognition")
-            engine = asr_mod.build(cfg)
+            try:
+                engine = asr_mod.build(cfg)
+            except ToolError as exc:
+                # `cfg.source == "asr"` is an explicit, sole request for ASR
+                # with nothing to fall back to -- a missing engine there is a
+                # real, actionable error. In every other case ASR is either
+                # supplementing OCR ("both") or covering for OCR having found
+                # nothing at all; a missing engine there should not discard
+                # whatever OCR already produced (which may be nothing, but
+                # even then the run should finish rather than abort).
+                if not attempting_asr_as_fallback:
+                    raise
+                self.warn(f"speech recognition unavailable, continuing without it: {exc}")
+                engine = None
             if engine is not None:
                 heard = engine.transcribe(audio, self.work / "asr", cfg.source_lang)
                 cues = self._prefer(cues, heard) if cues else heard
@@ -337,12 +351,19 @@ class Pipeline:
         else:
             self.warn(f"no {cfg.text.target_lang} audio track was produced")
 
-        sub_tracks = [Track(src_srt, cfg.text.source_lang)]
+        # A 0-cue SRT is not a file ffmpeg can open at all (empty input), so an
+        # empty track must be left out of the mux entirely rather than muxed
+        # as a "subtitle track with no subtitles in it".
+        sub_tracks: list[Track] = []
+        if src_cues:
+            sub_tracks.append(Track(src_srt, cfg.text.source_lang))
         if tgt_cues:
             sub_tracks.append(Track(tgt_srt, cfg.text.target_lang))
 
         default = cfg.default_lang.split("-")[0]
         for kind, tracks in (("audio", audio_tracks), ("subtitle", sub_tracks)):
+            if not tracks:
+                continue   # e.g. no subtitles were produced at all; nothing to flag
             if default not in {t.lang.split("-")[0] for t in tracks}:
                 self.warn(f"no {cfg.default_lang} {kind} track to flag as default; "
                           f"the first {kind} track will be used instead")

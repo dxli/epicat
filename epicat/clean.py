@@ -14,6 +14,8 @@ from .imaging import blend, dilate, feather, grow_mask, inpaint
 from .titles import TitleCard, erase_episode_number
 from .util import log
 
+OVERLAY_MARGIN = 16   # px of real surroundings given to inpaint() around a cleared region
+
 
 @dataclass
 class ClipPlan:
@@ -128,16 +130,33 @@ def render_clip(plan: ClipPlan, out_path: Path, cfg: Config) -> RenderStats:
                 out[y0:y1] = band
 
             for (bx, by, bw, bh), rmask in extra:
-                region = out[by:by + bh, bx:bx + bw]
+                if bw <= 0 or bh <= 0:
+                    continue
+                # Give inpaint() a margin of real surroundings to draw from --
+                # without it, a mask that fills the whole box (overlay
+                # detection's own "just treat all of it as overlay" fallback)
+                # would leave nothing known anywhere nearby to interpolate.
+                m = OVERLAY_MARGIN
+                ry0, ry1 = max(by - m, 0), min(by + bh + m, out.shape[0])
+                rx0, rx1 = max(bx - m, 0), min(bx + bw + m, out.shape[1])
+                region = out[ry0:ry1, rx0:rx1]
                 if region.size == 0:
                     continue
+                full_mask = np.zeros(region.shape[:2], dtype=bool)
+                full_mask[by - ry0:by - ry0 + bh, bx - rx0:bx - rx0 + bw] = rmask
                 out = out.copy() if out is frame else out
-                out[by:by + bh, bx:bx + bw] = inpaint(region, rmask)
+                out[ry0:ry1, rx0:rx1] = inpaint(region, full_mask)
                 stats.regions_cleared += 1
 
             enc.write(out)
             stats.frames_written += 1
-    finally:
+    except BaseException:
+        # Anything short of every frame being written -- Ctrl-C, a decode
+        # error, a dead encoder -- must not publish a truncated segment under
+        # the name a resumed run would trust as finished.
+        enc.abort()
+        raise
+    else:
         enc.close()
     return stats
 

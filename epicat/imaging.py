@@ -224,6 +224,14 @@ def inpaint(region: np.ndarray, mask: np.ndarray, *, iters: int | None = None,
 
     sub = region[y0:y1, x0:x1]
     sub_holes = holes[y0:y1, x0:x1]
+    if sub_holes.all():
+        # Nothing known anywhere in reach of the hole -- e.g. a caller passed
+        # a region that is entirely masked, with no surrounding margin to draw
+        # from. There is nothing to interpolate from, and guessing would mean
+        # fabricating a flat colour (black, in practice) where the seed-fill
+        # weights all collapse to zero. Leaving the pixels untouched is the
+        # least-wrong thing to do.
+        return region.copy()
     solved = _relax(sub, sub_holes, r, iters, smooth)
 
     out = region.copy()

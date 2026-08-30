@@ -53,9 +53,11 @@ class OllamaTranslator(Translator):
         try:
             with urllib.request.urlopen(f"{self.host}/api/tags", timeout=5) as fh:
                 tags = json.load(fh)
+            names = {m.get("name", "") for m in tags.get("models", [])}
         except Exception:
+            # Anything from a connection failure to a malformed or
+            # unexpectedly-shaped response means "not usable", not a crash.
             return False
-        names = {m.get("name", "") for m in tags.get("models", [])}
         if self.model in names or f"{self.model}:latest" in names:
             return True
         log(f"ollama is running but has no model {self.model!r}; "
@@ -73,9 +75,14 @@ class OllamaTranslator(Translator):
                                      headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as fh:
-                return json.load(fh).get("response", "")
+                reply = json.load(fh)
         except urllib.error.URLError as exc:
             raise ToolError(f"ollama request failed: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise ToolError(f"ollama returned a response that was not JSON: {exc}") from exc
+        if not isinstance(reply, dict):
+            raise ToolError(f"ollama returned an unexpected response shape: {reply!r:.200}")
+        return reply.get("response", "")
 
     def translate(self, texts: Sequence[str], src: str, dst: str,
                   budgets: Sequence[int] | None = None) -> list[str]:

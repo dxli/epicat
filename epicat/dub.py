@@ -11,7 +11,7 @@ from .config import AudioConfig
 from .ffmpeg import audio_duration
 from .subs import Cue
 from .tts import TtsBackend, Utterance
-from .util import log, run
+from .util import atomic_output, log, run
 
 
 def _read_wav(path: Path, rate: int) -> np.ndarray:
@@ -30,9 +30,10 @@ def _write_wav(path: Path, samples: np.ndarray, rate: int, channels: int) -> Non
     if channels == 2 and data.ndim == 1:
         data = np.stack([data, data], axis=1)
     pcm = (data * 32767.0).astype("<i2").tobytes()
-    run(["ffmpeg", "-v", "error", "-nostdin", "-y",
-         "-f", "s16le", "-ar", str(rate), "-ac", str(channels), "-i", "-",
-         "-c:a", "pcm_s16le", str(path)], stdin=pcm)
+    with atomic_output(path) as tmp:
+        run(["ffmpeg", "-v", "error", "-nostdin", "-y",
+             "-f", "s16le", "-ar", str(rate), "-ac", str(channels), "-i", "-",
+             "-c:a", "pcm_s16le", str(tmp)], stdin=pcm)
 
 
 def _slots(cues: Sequence[Cue], total: float) -> list[float]:
@@ -146,8 +147,9 @@ def mix_with_original(speech: Path, original: Path, out_path: Path,
         f"[ducked][mix]amix=inputs=2:duration=first:normalize=0,"
         f"alimiter=limit=0.97[out]"
     )
-    run(["ffmpeg", "-v", "error", "-nostdin", "-y",
-         "-i", str(original), "-i", str(speech),
-         "-filter_complex", filt, "-map", "[out]",
-         "-ar", str(acfg.sample_rate), "-ac", str(acfg.channels),
-         "-c:a", "pcm_s16le", str(out_path)])
+    with atomic_output(out_path) as tmp:
+        run(["ffmpeg", "-v", "error", "-nostdin", "-y",
+             "-i", str(original), "-i", str(speech),
+             "-filter_complex", filt, "-map", "[out]",
+             "-ar", str(acfg.sample_rate), "-ac", str(acfg.channels),
+             "-c:a", "pcm_s16le", str(tmp)])

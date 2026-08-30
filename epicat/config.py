@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import tomllib
+import typing
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
+
+from .util import ToolError
 
 
 @dataclass
@@ -119,7 +122,14 @@ class Config:
     def load(cls, path: str | Path | None = None) -> "Config":
         cfg = cls()
         if path:
-            data = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+            try:
+                text = Path(path).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ToolError(f"cannot read config file {path!r}: {exc}") from exc
+            try:
+                data = tomllib.loads(text)
+            except tomllib.TOMLDecodeError as exc:
+                raise ToolError(f"malformed TOML in {path!r}: {exc}") from exc
             _apply(cfg, data)
         return cfg
 
@@ -129,22 +139,62 @@ class Config:
             target: Any = self
             parts = key.split(".")
             for p in parts[:-1]:
+                if not hasattr(target, p):
+                    raise ToolError(f"unknown config key: {key}")
                 target = getattr(target, p)
             name = parts[-1]
             if not hasattr(target, name):
-                raise KeyError(f"unknown config key: {key}")
+                raise ToolError(f"unknown config key: {key}")
+            declared = typing.get_type_hints(type(target)).get(name)
             current = getattr(target, name)
-            setattr(target, name, _coerce(value, current))
+            try:
+                setattr(target, name, _coerce(value, declared, current))
+            except ValueError as exc:
+                raise ToolError(f"bad value for {key}: {exc}") from exc
 
 
-def _coerce(value: Any, current: Any) -> Any:
-    if isinstance(value, str):
-        if isinstance(current, bool):
-            return value.strip().lower() in ("1", "true", "yes", "on")
-        if isinstance(current, int) and not isinstance(current, bool):
+def _unwrap_optional(t: Any) -> Any:
+    """`X | None` -> `X`; anything else is returned unchanged."""
+    if typing.get_origin(t) is typing.Union:
+        args = [a for a in typing.get_args(t) if a is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return t
+
+
+def _coerce(value: Any, declared: Any, current: Any) -> Any:
+    """Coerce a `--set`/TOML string to the field's real type.
+
+    Dispatches on the field's *declared* annotation, not on the value it
+    currently holds -- a `float | None` field holding its default `None`
+    still needs to accept "0.5" as a float, which nothing about the runtime
+    value `None` alone can tell you.
+    """
+    if not isinstance(value, str):
+        return value
+    target = _unwrap_optional(declared) if declared is not None else None
+    is_bool = target is bool or (target is None and isinstance(current, bool))
+    is_int = target is int or (target is None and isinstance(current, int)
+                               and not isinstance(current, bool))
+    is_float = target is float or (target is None and isinstance(current, float))
+
+    if is_bool:
+        low = value.strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off"):
+            return False
+        raise ValueError(f"expected a boolean (true/false/yes/no/1/0), got {value!r}")
+    if is_int:
+        try:
             return int(value)
-        if isinstance(current, float):
+        except ValueError:
+            raise ValueError(f"expected an integer, got {value!r}") from None
+    if is_float:
+        try:
             return float(value)
+        except ValueError:
+            raise ValueError(f"expected a number, got {value!r}") from None
     return value
 
 
@@ -152,7 +202,7 @@ def _apply(obj: Any, data: dict) -> None:
     names = {f.name for f in fields(obj)}
     for key, value in data.items():
         if key not in names:
-            raise KeyError(f"unknown config key: {key}")
+            raise ToolError(f"unknown config key: {key}")
         current = getattr(obj, key)
         if is_dataclass(current) and isinstance(value, dict):
             _apply(current, value)

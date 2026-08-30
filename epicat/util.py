@@ -1,6 +1,7 @@
 """Small shared helpers: logging, subprocess, JSON state."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -9,7 +10,7 @@ import sys
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 _T0 = time.time()
 VERBOSE = False
@@ -71,9 +72,36 @@ def _jsonable(o: Any) -> Any:
     return o
 
 
-def write_json(path: Path, obj: Any) -> None:
+@contextlib.contextmanager
+def atomic_output(path: str | Path) -> Iterator[Path]:
+    """Yield a temporary path to write to; publish it onto `path` only if the
+    `with` block finishes without raising.
+
+    Every file a resumed run trusts by mere existence -- a rendered segment, a
+    cue list, a combined track -- has to go through this: otherwise a process
+    killed mid-write (Ctrl-C, a crash, an OOM kill) leaves a partial file that
+    the *next* run mistakes for a finished one. `os.replace` is atomic on both
+    POSIX and Windows, which is what makes the swap safe even in that case.
+    """
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_jsonable(obj), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # The suffix has to survive the rename intact: ffmpeg (and other tools)
+    # infer the output format from a file's extension, so a temp name of
+    # "video.mp4.part" would make ffmpeg refuse to write it at all.
+    tmp = path.with_name(path.stem + ".part" + path.suffix)
+    try:
+        yield tmp
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    else:
+        os.replace(tmp, path)
+
+
+def write_json(path: Path, obj: Any) -> None:
+    with atomic_output(path) as tmp:
+        tmp.write_text(json.dumps(_jsonable(obj), ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
 
 
 def read_json(path: Path) -> Any:
@@ -81,7 +109,7 @@ def read_json(path: Path) -> Any:
 
 
 def human_time(seconds: float) -> str:
-    ms = int(round(seconds * 1000))
+    ms = int(round(max(seconds, 0.0) * 1000))
     h, ms = divmod(ms, 3_600_000)
     m, ms = divmod(ms, 60_000)
     s, ms = divmod(ms, 1000)
