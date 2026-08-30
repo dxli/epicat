@@ -4,9 +4,11 @@
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import numpy as np
@@ -246,6 +248,158 @@ class TestConfig(unittest.TestCase):
     def test_unknown_key_is_rejected(self):
         with self.assertRaises(KeyError):
             Config().apply_overrides({"band.nope": 1})
+
+
+class TestBootstrap(unittest.TestCase):
+    """bootstrap.py must never touch the real system in a test: every case
+    below fakes out subprocess/os/network before calling into it."""
+
+    def test_imports_without_numpy(self):
+        # The whole point of --bootstrap is getting numpy (and everything
+        # else) installed in the first place, so importing it -- and routing
+        # to it from the CLI -- must not require numpy to already be present.
+        # This test's own process already has numpy loaded (other test
+        # classes in this file import it), so the only reliable check is a
+        # fresh subprocess that never imports the numpy-dependent modules.
+        root = Path(__file__).resolve().parent.parent
+        script = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "import epicat.bootstrap\n"
+            "import epicat.cli\n"
+            "assert 'numpy' not in sys.modules, sorted(sys.modules)\n"
+            "print('ok')\n"
+        ) % str(root)
+        proc = subprocess.run([sys.executable, "-c", script],
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "ok")
+
+    def test_command_tables_cover_every_supported_manager(self):
+        from epicat.bootstrap import _manager_install_cmd
+        for mgr in ("brew", "apt-get", "dnf", "yum", "pacman", "zypper", "apk",
+                   "winget", "choco"):
+            cmd = _manager_install_cmd(mgr, ["ffmpeg"])
+            self.assertIn("ffmpeg", cmd)
+            self.assertEqual(cmd[0], mgr)
+
+    def test_unknown_manager_is_rejected(self):
+        from epicat.bootstrap import _manager_install_cmd
+        with self.assertRaises(ValueError):
+            _manager_install_cmd("nuget", ["ffmpeg"])
+
+    def test_linux_admin_step_is_sudo_prefixed_when_not_root(self):
+        import epicat.bootstrap as b
+        calls = []
+        with unittest.mock.patch.object(b.subprocess, "run",
+                                        side_effect=lambda cmd, **kw: calls.append(cmd) or
+                                        unittest.mock.Mock(returncode=0)), \
+             unittest.mock.patch.object(b.os, "geteuid", return_value=1000, create=True):
+            ok = b.run_step(["apt-get", "install", "-y", "ffmpeg"],
+                            needs_admin=True, os_name=b.OS_LINUX, dry_run=False)
+        self.assertTrue(ok)
+        self.assertEqual(calls, [["sudo", "apt-get", "install", "-y", "ffmpeg"]])
+
+    def test_root_is_not_sudo_prefixed(self):
+        import epicat.bootstrap as b
+        calls = []
+        with unittest.mock.patch.object(b.subprocess, "run",
+                                        side_effect=lambda cmd, **kw: calls.append(cmd) or
+                                        unittest.mock.Mock(returncode=0)), \
+             unittest.mock.patch.object(b.os, "geteuid", return_value=0, create=True):
+            b.run_step(["apt-get", "install", "-y", "ffmpeg"],
+                      needs_admin=True, os_name=b.OS_LINUX, dry_run=False)
+        self.assertEqual(calls, [["apt-get", "install", "-y", "ffmpeg"]])
+
+    def test_macos_never_gets_sudo(self):
+        import epicat.bootstrap as b
+        calls = []
+        with unittest.mock.patch.object(b.subprocess, "run",
+                                        side_effect=lambda cmd, **kw: calls.append(cmd) or
+                                        unittest.mock.Mock(returncode=0)):
+            b.run_step(["brew", "install", "ffmpeg"], needs_admin=False,
+                      os_name=b.OS_MACOS, dry_run=False)
+        self.assertEqual(calls, [["brew", "install", "ffmpeg"]])
+
+    def test_windows_admin_step_elevates_via_powershell(self):
+        import epicat.bootstrap as b
+        with unittest.mock.patch.object(b, "_is_admin_windows", return_value=False), \
+             unittest.mock.patch.object(b, "_run_windows_elevated",
+                                        return_value=0) as elevated:
+            ok = b.run_step(["winget", "install", "-e", "--id", "Gyan.FFmpeg"],
+                            needs_admin=True, os_name=b.OS_WINDOWS, dry_run=False)
+        self.assertTrue(ok)
+        elevated.assert_called_once()
+
+    def test_dry_run_prints_but_runs_nothing(self):
+        import epicat.bootstrap as b
+        with unittest.mock.patch.object(b.subprocess, "run") as run:
+            ok = b.run_step(["brew", "install", "ffmpeg"], needs_admin=False,
+                            os_name=b.OS_MACOS, dry_run=True)
+        self.assertTrue(ok)
+        run.assert_not_called()
+
+    def test_check_only_never_installs(self):
+        import epicat.bootstrap as b
+        with unittest.mock.patch.object(b, "detect_os", return_value=b.OS_MACOS), \
+             unittest.mock.patch.object(b, "detect_manager", return_value="brew"), \
+             unittest.mock.patch.object(b, "_has", return_value=False), \
+             unittest.mock.patch.object(b, "_install") as install:
+            rc = b.run_bootstrap(check_only=True, only=["ffmpeg"])
+        install.assert_not_called()
+        self.assertEqual(rc, 1)   # ffmpeg is required and reported missing
+
+    def test_plan_marks_ffmpeg_required_everywhere(self):
+        from epicat.bootstrap import COMPONENTS, OS_LINUX, OS_MACOS, OS_WINDOWS
+        ffmpeg = next(c for c in COMPONENTS if c.key == "ffmpeg")
+        for os_name in (OS_LINUX, OS_MACOS, OS_WINDOWS):
+            self.assertTrue(ffmpeg.required(os_name))
+
+    def test_tesseract_required_off_macos_only(self):
+        from epicat.bootstrap import COMPONENTS, OS_LINUX, OS_MACOS, OS_WINDOWS
+        tess = next(c for c in COMPONENTS if c.key == "tesseract")
+        self.assertFalse(tess.required(OS_MACOS))
+        self.assertTrue(tess.required(OS_LINUX))
+        self.assertTrue(tess.required(OS_WINDOWS))
+
+    def test_ollama_on_linux_is_installable_without_a_package_manager(self):
+        from epicat.bootstrap import _installable, OS_LINUX, COMPONENTS
+        ollama = next(c for c in COMPONENTS if c.key == "ollama")
+        installable, reason = _installable(ollama, OS_LINUX, mgr=None)
+        self.assertTrue(installable)
+
+    def test_unrecognised_os_is_reported_and_refused(self):
+        import epicat.bootstrap as b
+        with unittest.mock.patch.object(b, "detect_os", return_value=b.OS_OTHER):
+            self.assertEqual(b.run_bootstrap(check_only=True), 1)
+
+    def test_only_filter_with_no_match_fails_cleanly(self):
+        import epicat.bootstrap as b
+        with unittest.mock.patch.object(b, "detect_os", return_value=b.OS_MACOS), \
+             unittest.mock.patch.object(b, "detect_manager", return_value="brew"):
+            self.assertEqual(b.run_bootstrap(check_only=True, only=["not-a-real-component"]), 1)
+
+
+class TestCliBootstrapDispatch(unittest.TestCase):
+    """--bootstrap must short-circuit before the numpy-dependent pipeline
+    import, and route through epicat.bootstrap.run_bootstrap."""
+
+    def test_bootstrap_flag_dispatches_without_importing_pipeline(self):
+        import epicat.cli as cli
+        with unittest.mock.patch("epicat.bootstrap.run_bootstrap",
+                                 return_value=0) as run_bootstrap:
+            rc = cli.main(["--bootstrap", "--check"])
+        run_bootstrap.assert_called_once()
+        self.assertEqual(rc, 0)
+        _, kwargs = run_bootstrap.call_args
+        self.assertTrue(kwargs["check_only"])
+
+    def test_only_flag_is_split_on_commas(self):
+        import epicat.cli as cli
+        with unittest.mock.patch("epicat.bootstrap.run_bootstrap",
+                                 return_value=0) as run_bootstrap:
+            cli.main(["--bootstrap", "--only", "ffmpeg, node"])
+        _, kwargs = run_bootstrap.call_args
+        self.assertEqual(kwargs["only"], ["ffmpeg", "node"])
 
 
 if __name__ == "__main__":

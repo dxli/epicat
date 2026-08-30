@@ -4,10 +4,18 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from .config import Config
-from .pipeline import STAGES, Pipeline
+from .stages import STAGES
 from .util import ToolError, human_time, set_verbose
+
+# `Config` and `Pipeline` pull in numpy transitively; importing them is
+# deferred to inside `main()` so that `--bootstrap` -- whose entire purpose is
+# getting dependencies like numpy installed in the first place -- works even
+# when none of that is present yet.
+if TYPE_CHECKING:
+    from .config import Config
+    from .pipeline import Pipeline
 
 DESCRIPTION = """\
 Join a set of episode clips into one file: order them by the episode number on
@@ -32,6 +40,24 @@ def build_parser() -> argparse.ArgumentParser:
                    help="analyse the clips and print what would happen, then stop")
     p.add_argument("--force-from", choices=STAGES, default=None,
                    help="redo this stage and everything after it")
+
+    g = p.add_argument_group("bootstrap", "set up the tools epicat needs, then exit")
+    g.add_argument("--bootstrap", action="store_true",
+                   help="detect and install missing dependencies with the system "
+                        "package manager (Homebrew, apt, dnf, pacman, zypper, apk, "
+                        "winget, or choco -- whichever applies), then exit")
+    g.add_argument("--check", action="store_true",
+                   help="with --bootstrap: report what is missing, install nothing")
+    g.add_argument("--yes", "-y", action="store_true",
+                   help="with --bootstrap: don't ask before each install "
+                        "(you may still see an OS password/UAC prompt)")
+    g.add_argument("--optional", action="store_true",
+                   help="with --bootstrap: also install optional components "
+                        "(translation, dubbing, speech recognition), not just "
+                        "what the core pipeline requires")
+    g.add_argument("--only", default=None, metavar="NAME,NAME,...",
+                   help="with --bootstrap: limit to these components, e.g. "
+                        "--only ffmpeg,node")
 
     g = p.add_argument_group("languages")
     g.add_argument("--source-lang", default=None, help="language of the clips (default: zh)")
@@ -76,7 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def make_config(args: argparse.Namespace) -> Config:
+def make_config(args: argparse.Namespace) -> "Config":
+    from .config import Config
     cfg = Config.load(args.config)
     if args.inputs:
         cfg.inputs = [str(Path(i)) for i in args.inputs]
@@ -175,6 +202,19 @@ def print_plan(pipe: Pipeline) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     set_verbose(args.verbose)
+
+    if args.bootstrap:
+        from .bootstrap import run_bootstrap
+        only = [s.strip() for s in args.only.split(",")] if args.only else None
+        try:
+            return run_bootstrap(check_only=args.check, assume_yes=args.yes,
+                                 only=only, include_optional=args.optional)
+        except KeyboardInterrupt:
+            print("\nepicat: interrupted", file=sys.stderr)
+            return 130
+
+    from .pipeline import Pipeline
+
     try:
         cfg = make_config(args)
         pipe = Pipeline(cfg, force_from=args.force_from)

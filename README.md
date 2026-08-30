@@ -53,17 +53,46 @@ series.work/      intermediates, kept so a run can be resumed
 
 | Need | Used for | Notes |
 | --- | --- | --- |
-| `ffmpeg` / `ffprobe` | everything | `brew install ffmpeg` |
+| `ffmpeg` / `ffprobe` | everything | required on every platform |
 | Python 3.11+ with `numpy` | frame processing | no other Python dependencies |
-| `swiftc` | OCR via Apple Vision | ships with the Xcode command line tools; the helper is built on first use |
+| `swiftc` (macOS) or `tesseract` (Linux/Windows) | OCR | macOS uses Apple Vision by default; the helper is built on first use |
 | `ollama` | translation | optional — `--translate-backend passthrough` skips it |
-| `node` | Kokoro speech synthesis | optional — falls back to macOS `say` |
+| `node` | Kokoro speech synthesis | optional — falls back to macOS `say` where available |
 | `whisper-cli` | speech recognition | optional — only for `--sub-source asr` |
 
-On a machine without `swiftc`, `tesseract` with a Chinese language pack works as
-a fallback OCR backend.
+`ffmpeg`, an OCR backend, and Python/`numpy` are what the core pipeline needs.
+Everything else is optional and only used for the features it names.
 
-### Setting up the optional pieces
+### Bootstrap
+
+```bash
+python3 epicat.py --bootstrap
+```
+
+installs what's missing with the platform's own package manager — Homebrew on
+macOS, whichever of `apt`, `dnf`/`yum`, `pacman`, `zypper`, or `apk` is present
+on Linux, `winget` (or Chocolatey) on Windows — asking for your password or a
+UAC prompt only when a step actually needs one. Nothing installs without your
+say-so: each step is confirmed individually unless you pass `--yes`.
+
+```bash
+python3 epicat.py --bootstrap --check       # report what's missing, install nothing
+python3 epicat.py --bootstrap --yes         # install the required pieces, no prompts
+python3 epicat.py --bootstrap --optional    # also install translation, dubbing, ASR
+python3 epicat.py --bootstrap --only ffmpeg,node   # limit to specific components
+```
+
+On macOS, if Homebrew itself is missing, bootstrap offers to install it first.
+On Linux, Ollama has no reliable cross-distro package, so it's installed from
+its own official script instead of the system package manager. A few pieces —
+Xcode Command Line Tools on macOS, `whisper-cli` on Linux/Windows — have no
+scriptable installer; bootstrap prints what to run or where to get them instead
+of guessing.
+
+`--bootstrap` works standalone: it never imports `numpy` or anything else
+epicat depends on, so it runs even on a machine with nothing set up yet.
+
+### Setting up the optional pieces by hand
 
 ```bash
 # translation
@@ -175,6 +204,12 @@ dialogue.
 --force-from STAGE        redo this stage and everything after it
                           (analyse render captions concat text translate
                            dub mux)
+
+--bootstrap               install missing dependencies, then exit (see above)
+--check                   with --bootstrap: report only, install nothing
+--yes / -y                with --bootstrap: don't ask before each install
+--optional                with --bootstrap: also install optional pieces
+--only NAME,NAME,...      with --bootstrap: limit to these components
 
 --source-lang / --target-lang / --default-lang
 --no-titles               do not look for title cards

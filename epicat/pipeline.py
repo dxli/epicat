@@ -23,12 +23,10 @@ from .ffmpeg import (Media, audio_duration, concat_videos, concat_wavs,
                      extract_audio, probe)
 from .mux import Track, mux, track_title
 from .ocr import Ocr
+from .stages import STAGES
 from .subs import Cue, read_srt, write_srt, write_vtt
 from .titles import detect_card, read_card
 from .util import ToolError, log, read_json, write_json
-
-STAGES = ("analyse", "render", "captions", "concat", "text", "translate",
-          "dub", "mux")
 
 
 @dataclass
