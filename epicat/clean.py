@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -37,6 +38,7 @@ class ClipPlan:
 class RenderStats:
     frames_written: int = 0
     frames_patched: int = 0
+    frames_shifted: int = 0
     frames_inpainted: int = 0
     number_frames: int = 0
     donor_rejected: int = 0
@@ -60,6 +62,64 @@ def _pick_donor(scan: BandScan) -> dict[int, int]:
     return choice
 
 
+def _plan_by_frame(scan: BandScan) -> dict[int, list]:
+    """Map every frame in a no-donor run to that run's texture-fill plan."""
+    out: dict[int, list] = {}
+    for run in scan.runs:
+        if not run.shift_plan:
+            continue
+        for i in range(run.start, run.end):
+            out[i] = run.shift_plan
+    return out
+
+
+def _apply_shift_plan(band: np.ndarray, mask: np.ndarray, plan: Sequence,
+                      bcfg) -> tuple[np.ndarray, np.ndarray]:
+    """Apply a run's precomputed texture-fill plan to one frame's band.
+
+    The plan was searched once, on the run's clearest frame; this frame's own
+    content may have drifted since (a pan, a slow zoom), so every chunk is
+    re-checked here the same way a donor is: does its surrounding ring still
+    look like a match? A chunk that no longer does, or a hole pixel the plan
+    never covered, is left for the harmonic fallback.
+
+    Returns (band, covered) -- `covered` marks the hole pixels this call
+    actually filled; the caller inpaints whatever `mask & ~covered` leaves.
+    """
+    original = band          # every read comes from here, never from `out`
+    out = band.copy()        # every write goes here
+    covered = np.zeros_like(mask)
+    for chunk in plan:
+        y0, y1, x0, x1 = chunk.box
+        local_holes = mask[y0:y1, x0:x1]
+        if not local_holes.any():
+            continue
+        H, W = mask.shape
+        sy0, sy1 = y0 + chunk.dy, y1 + chunk.dy
+        sx0, sx1 = x0 + chunk.dx, x1 + chunk.dx
+        if sy0 < 0 or sx0 < 0 or sy1 > H or sx1 > W:
+            continue
+        ring = dilate(local_holes, bcfg.shift_ring) & ~local_holes
+        if ring.any():
+            # Adjacent chunks' padded boxes can overlap by a few pixels;
+            # reading both sides from `original` keeps this check -- and the
+            # patch below -- from ever seeing another chunk's own fill.
+            here = original[y0:y1, x0:x1][ring].astype(np.float64)
+            there = original[sy0:sy1, sx0:sx1][ring].astype(np.float64)
+            # Same metric best_shift() planned against -- MSE normalised by
+            # the ring's own variance -- not donor_match_tolerance, which is
+            # a raw-difference threshold calibrated for a different scale.
+            variance = float(np.var(here)) + 1.0
+            quality = float(np.mean((here - there) ** 2)) / variance
+            if quality > bcfg.shift_quality_max:
+                continue
+        patch = original[sy0:sy1, sx0:sx1]
+        alpha = feather(local_holes, bcfg.shift_feather)
+        out[y0:y1, x0:x1] = blend(original[y0:y1, x0:x1], patch, alpha)
+        covered[y0:y1, x0:x1] |= local_holes
+    return out, covered
+
+
 def _overlays(cfg: Config, media: Media) -> list[tuple[tuple[int, int, int, int], np.ndarray]]:
     """Work out, once per clip, which pixels each extra region should clear."""
     found = []
@@ -79,6 +139,7 @@ def render_clip(plan: ClipPlan, out_path: Path, cfg: Config) -> RenderStats:
 
     donors: dict[int, int] = {}
     donor_bands: dict[int, np.ndarray] = {}
+    plans: dict[int, list] = {}
     if scan is not None and bcfg.enabled:
         donors = _pick_donor(scan)
         wanted = donor_indices(scan)
@@ -88,6 +149,7 @@ def render_clip(plan: ClipPlan, out_path: Path, cfg: Config) -> RenderStats:
                 vf=scan.band.crop_filter(media.width))
             log(f"clip {plan.index}: fetched {len(donor_bands)}/{len(wanted)} donor frames",
                 level="debug")
+        plans = _plan_by_frame(scan)
 
     extra = _overlays(cfg, media)
     y0 = scan.band.y0 if scan else 0
@@ -124,8 +186,16 @@ def render_clip(plan: ClipPlan, out_path: Path, cfg: Config) -> RenderStats:
                     band = blend(band, patch, alpha)
                     stats.frames_patched += 1
                 else:
-                    band = inpaint(band, mask, smooth=max(bcfg.dilate, 2))
-                    stats.frames_inpainted += 1
+                    frame_plan = plans.get(idx)
+                    remaining = mask
+                    if frame_plan:
+                        band, covered = _apply_shift_plan(band, mask, frame_plan, bcfg)
+                        if covered.any():
+                            stats.frames_shifted += 1
+                        remaining = mask & ~covered
+                    if remaining.any():
+                        band = inpaint(band, remaining, smooth=max(bcfg.dilate, 2))
+                        stats.frames_inpainted += 1
                 out = out.copy() if out is frame else out
                 out[y0:y1] = band
 

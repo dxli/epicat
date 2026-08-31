@@ -7,8 +7,8 @@ from typing import Sequence
 import numpy as np
 
 from .config import SubtitleBandConfig
-from .ffmpeg import Media, read_frames
-from .imaging import text_mask
+from .ffmpeg import Media, read_frames, read_frames_at
+from .imaging import best_shift, dilate, grow_mask, text_mask
 from .util import log
 
 
@@ -32,9 +32,20 @@ class Run:
     end: int                 # exclusive
     donor_before: int | None = None
     donor_after: int | None = None
+    shift_plan: list["ChunkShift"] = field(default_factory=list)
 
     def __len__(self) -> int:
         return self.end - self.start
+
+
+@dataclass
+class ChunkShift:
+    """One column of a run's texture-fill plan: paste real content translated
+    by (dy, dx) into this box. Computed once from a reference frame and
+    re-validated per frame at render time -- see clean.py."""
+    box: tuple[int, int, int, int]     # (y0, y1, x0, x1) in band coordinates
+    dy: int
+    dx: int
 
 
 @dataclass
@@ -170,6 +181,8 @@ def scan(media: Media, band: Band, cfg: SubtitleBandConfig) -> BandScan:
                   has_text=has_text, packed=packed, shot_break=breaks)
     sc.runs = find_runs(has_text, cfg)
     assign_donors(sc, cfg)
+    if cfg.texture_fill:
+        assign_shift_plans(sc, media, cfg)
     return sc
 
 
@@ -231,6 +244,71 @@ def assign_donors(sc: BandScan, cfg: SubtitleBandConfig) -> None:
                 run.donor_after = j
                 break
             j += 1
+
+
+def assign_shift_plans(sc: BandScan, media: Media, cfg: SubtitleBandConfig) -> None:
+    """For runs with no donor at all, plan a texture-aware fill.
+
+    Harmonic inpainting is the fallback everywhere, but it can only diffuse
+    smooth colour -- it blurs out any real texture (wood grain, brickwork,
+    fabric weave) instead of continuing it. Where no clean frame exists to
+    donate from, this looks instead for content nearby, within the same
+    frame, that a hole-shaped patch can be translated in from.
+
+    Searching a translation is too slow to do for every frame -- see
+    `best_shift`'s cost -- so it is done once per run, from that run's most
+    fully-drawn frame, and the resulting plan is re-validated per frame at
+    render time (clean.py) rather than re-searched.
+    """
+    targets = [r for r in sc.runs if r.donor_before is None and r.donor_after is None]
+    if not targets:
+        return
+
+    ref_indices = [r.start + int(np.argmax(sc.counts[r.start:r.end])) for r in targets]
+    frames = read_frames_at(media.path, media.width, sc.band.height, ref_indices,
+                            vf=sc.band.crop_filter(media.width))
+
+    for run, ref_idx in zip(targets, ref_indices):
+        band = frames.get(ref_idx)
+        if band is None:
+            continue
+        seed = sc.mask(ref_idx)
+        mask = dilate(grow_mask(band, seed, grow_luma=cfg.grow_luma, grow_sat=cfg.grow_sat,
+                                steps=cfg.grow_steps, min_contrast=cfg.grow_contrast,
+                                stroke=cfg.stroke), cfg.dilate)
+        if not mask.any():
+            continue
+        run.shift_plan = _plan_for_mask(band, mask, cfg)
+
+
+def _plan_for_mask(band: np.ndarray, mask: np.ndarray, cfg: SubtitleBandConfig) -> list["ChunkShift"]:
+    H, W = mask.shape
+    ys, xs = np.nonzero(mask)
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    plan: list[ChunkShift] = []
+
+    x = x0
+    chunk_w = cfg.shift_chunk_width
+    ring = cfg.shift_ring
+    while x < x1:
+        cx1 = min(x + chunk_w, x1)
+        col = mask[:, x:cx1]
+        if not col.any():
+            x = cx1
+            continue
+        cys, cxs = np.nonzero(col)
+        cy0, cy1 = int(cys.min()), int(cys.max()) + 1
+        cx0r, cx1r = x + int(cxs.min()), x + int(cxs.max()) + 1
+
+        box = (max(cy0 - ring, 0), min(cy1 + ring, H),
+              max(cx0r - ring, 0), min(cx1r + ring, W))
+        result = best_shift(band, mask, box, ring=ring,
+                            search_y=cfg.shift_search_y, search_x=cfg.shift_search_x)
+        if result is not None and result[0] <= cfg.shift_quality_max:
+            _, dy, dx = result
+            plan.append(ChunkShift(box=box, dy=dy, dx=dx))
+        x = cx1
+    return plan
 
 
 def donor_indices(scan_: BandScan) -> list[int]:

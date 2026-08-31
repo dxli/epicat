@@ -61,6 +61,17 @@ class SubtitleBandConfig:
     extra_max_sat: int = 70
     extra_contrast: float = 8.0
     extra_persistence: float = 0.35   # share of the peak persistent response to call overlay
+    # Texture-aware fill: where a caption run has no donor frame at all,
+    # translate in real nearby content instead of always smoothing with
+    # harmonic inpainting. Planned once per run (from its clearest frame),
+    # re-validated per frame -- see bandscan.assign_shift_plans.
+    texture_fill: bool = True
+    shift_chunk_width: int = 40       # px per independently-matched column
+    shift_ring: int = 5               # px of context compared around each chunk
+    shift_search_y: int = 6           # px of vertical search room
+    shift_search_x: int = 140         # px of horizontal search room
+    shift_quality_max: float = 1.4    # reject a match this much worse than the ring's own variance
+    shift_feather: int = 3
 
 
 @dataclass

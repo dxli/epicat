@@ -30,6 +30,12 @@ default_lang = "en"
 # shot_break_delta = 6.0
 # donor_match_tolerance = 9.0
 
+# Texture-aware fill: where a caption run has no donor frame anywhere in its
+# shot, look for real nearby content to translate in before falling back to
+# a plain (texture-blurring) inpaint. On by default.
+# texture_fill = true
+# shift_quality_max = 1.4   # reject a match this much worse than the surroundings' own variance
+
 # Static overlays -- a watermark, a channel bug -- as fractions of the frame:
 # [x, y, width, height]. The overlay is found by what stays put across frames,
 # so semi-transparent ones work too. Off unless set.

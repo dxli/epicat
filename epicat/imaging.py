@@ -336,3 +336,70 @@ def plate_fill(region: np.ndarray, box: tuple[int, int, int, int], *,
     patch = np.broadcast_to(colour.astype(np.float32), region.shape).astype(np.uint8)
     alpha = feather(inner_mask, feather_px)
     return blend(region, patch, alpha)
+
+
+# ------------------------------------------------------- texture-aware fill
+
+
+def best_shift(region: np.ndarray, holes: np.ndarray, box: tuple[int, int, int, int], *,
+               ring: int = 5, search_y: int = 6, search_x: int = 140
+               ) -> tuple[float, int, int] | None:
+    """Find the translation that best re-uses real, nearby content for `box`.
+
+    Harmonic inpainting can only diffuse smooth colour into a hole -- it
+    cannot invent texture, so a hole over wood grain or brickwork comes back
+    as a soft blur. Where the hole sits on content that repeats nearby (most
+    textures do, at least locally), a hole-shaped patch of *real* pixels,
+    picked up from a few dozen pixels away, is dramatically more convincing.
+
+    `box` is (y0, y1, x0, x1) in `region`/`holes` coordinates: the area to
+    fill, typically already padded by a small margin. Returns
+    `(quality, dy, dx)` -- the best offset and how well its surrounding ring
+    matches this box's own ring (lower is better; roughly 1.0 means "about as
+    well as the ring matches itself", i.e. a strong match) -- or None if no
+    offset lands entirely on real pixels within the search window.
+    """
+    y0, y1, x0, x1 = box
+    H, W = holes.shape
+    local_holes = holes[y0:y1, x0:x1]
+    local_ring = dilate(local_holes, ring) & ~local_holes
+    if not local_ring.any():
+        return None
+
+    region_f = region.astype(np.float64)
+    real = region_f[y0:y1, x0:x1][local_ring]
+    real_var = float(np.var(real)) + 1.0  # a flat ring must not divide by ~0
+
+    best: tuple[float, int, int] | None = None
+    for dy in range(-search_y, search_y + 1):
+        sy0, sy1 = y0 + dy, y1 + dy
+        if sy0 < 0 or sy1 > H:
+            continue
+        for dx in range(-search_x, search_x + 1):
+            if dy == 0 and dx == 0:
+                continue
+            sx0, sx1 = x0 + dx, x1 + dx
+            if sx0 < 0 or sx1 > W:
+                continue
+            if holes[sy0:sy1, sx0:sx1][local_holes].any():
+                continue  # this offset would copy from another hole
+            cand = region_f[sy0:sy1, sx0:sx1][local_ring]
+            score = float(np.mean((cand - real) ** 2))
+            if best is None or score < best[0]:
+                best = (score, dy, dx)
+    if best is None:
+        return None
+    score, dy, dx = best
+    return score / real_var, dy, dx
+
+
+def apply_shift(region: np.ndarray, holes: np.ndarray, box: tuple[int, int, int, int],
+                dy: int, dx: int, *, feather_px: int = 3) -> np.ndarray:
+    """Paste the box, translated by (dy, dx), over its own hole pixels."""
+    y0, y1, x0, x1 = box
+    local_holes = holes[y0:y1, x0:x1]
+    patch = region[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
+    alpha = feather(local_holes, feather_px)
+    out = region.copy()
+    out[y0:y1, x0:x1] = blend(region[y0:y1, x0:x1], patch, alpha)
+    return out

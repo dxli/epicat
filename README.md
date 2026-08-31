@@ -149,9 +149,25 @@ Removing the glyphs is a two-step job:
 - **Fill.** Where a clean frame exists in the same shot, its background is
   pasted in behind the glyphs. A donor whose surroundings no longer match the
   current frame is rejected, so a missed cut cannot produce a visibly wrong
-  patch. Otherwise the hole is inpainted: seeded by a distance-weighted fill and
-  relaxed towards the solution of the Laplace equation, solved with red-black
-  over-relaxation on the mask's bounding box.
+  patch.
+
+  Where no clean frame exists anywhere in the shot, the fallback is harmonic
+  (Laplace) inpainting — smooth, safe, and the right tool for gradients, but
+  it cannot invent texture: a hole over wood grain or brickwork comes back
+  softly blurred, because diffusion has nothing but colour to work with.
+  Before falling back to that, each run is checked once (not per frame — see
+  below) for real, nearby content a hole-shaped patch could be translated in
+  from instead — most textures repeat close by, at least locally, and a
+  translated *real* patch keeps the grain instead of smoothing it away. The
+  match is scored against its own surrounding ring, and a weak match is
+  passed over in favour of the harmonic fallback rather than risking a
+  visibly wrong patch — the two combine per caption, at whatever mix each
+  captioned run's content actually supports. What that plan finds is then
+  re-checked on every frame it is applied to, the same way a donor is: the
+  plan is searched once per run (this search is too slow to repeat per frame),
+  but content drifts across a run — a pan, a slow zoom — so a chunk whose
+  match has stopped holding up on the current frame falls through to harmonic
+  inpainting for that frame instead of forcing a stale patch in.
 
 [tophat]: https://en.wikipedia.org/wiki/Top-hat_transform
 
@@ -300,7 +316,8 @@ re-run from `dub`.
 - Clips must share a frame size. Differing frame rates are allowed but warned
   about, since timing can drift.
 - Caption removal is inpainting, not reconstruction. Where a caption sat on
-  detailed artwork with no clean frame in the shot to borrow from, the strip is
+  detailed artwork with no clean frame in the shot to borrow from and no real
+  nearby content a texture-aware fill could use either, the strip is
   softened. It is not possible to recover what was never recorded.
 - The dubbed track is synthetic speech. It is a single voice, and it does not act.
 - The Apple Vision OCR backend is macOS-only. Elsewhere, install `tesseract`

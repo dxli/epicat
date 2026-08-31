@@ -711,5 +711,123 @@ class TestDubTrackIsSpeechOnly(unittest.TestCase):
         self.assertEqual(params, ["self", "target_cues", "total"])
 
 
+class TestTextureAwareFill(unittest.TestCase):
+    """best_shift()/apply_shift() and the run-level plan built on top of them
+    (bandscan.assign_shift_plans, clean._apply_shift_plan) -- the texture-fill
+    alternative to harmonic inpainting for holes with no donor frame."""
+
+    @staticmethod
+    def _striped_image(h=60, w=240, period=20):
+        # A repeating vertical-stripe texture: any offset that is a multiple
+        # of `period` is a perfect match, which makes this deterministic and
+        # gives a known-good answer to test best_shift against.
+        x = np.arange(w)
+        stripe = ((x % period) < period // 2).astype(np.uint8) * 200 + 20
+        return np.repeat(np.repeat(stripe[None, :, None], h, axis=0), 3, axis=2)
+
+    def test_best_shift_finds_the_repeat_period(self):
+        from epicat.imaging import best_shift
+        img = self._striped_image()
+        holes = np.zeros(img.shape[:2], dtype=bool)
+        holes[20:40, 100:120] = True
+        result = best_shift(img, holes, (15, 45, 95, 125), ring=5, search_y=2, search_x=60)
+        self.assertIsNotNone(result)
+        quality, dy, dx = result
+        self.assertLess(quality, 0.05)          # a near-perfect match must exist
+        self.assertEqual(dx % 20, 0)             # and it must land on the repeat period
+
+    def test_apply_shift_recovers_the_texture(self):
+        from epicat.imaging import best_shift, apply_shift
+        img = self._striped_image()
+        holes = np.zeros(img.shape[:2], dtype=bool)
+        holes[20:40, 100:120] = True
+        box = (15, 45, 95, 125)
+        quality, dy, dx = best_shift(img, holes, box, ring=5, search_y=2, search_x=60)
+        filled = apply_shift(img, holes, box, dy, dx, feather_px=0)
+        # Away from the feathered edge, the recovered stripe must match the
+        # original exactly -- this is real content, not a blur.
+        core = holes.copy()
+        core[:, :102] = False
+        core[:, 118:] = False
+        self.assertTrue((filled[core] == img[core]).all())
+
+    def test_best_shift_returns_none_for_unique_content(self):
+        from epicat.imaging import best_shift
+        rng = np.random.default_rng(0)
+        img = rng.integers(0, 255, (60, 240, 3), dtype=np.uint8)  # pure noise: nothing repeats
+        holes = np.zeros(img.shape[:2], dtype=bool)
+        holes[20:40, 100:120] = True
+        result = best_shift(img, holes, (15, 45, 95, 125), ring=5, search_y=2, search_x=60)
+        # A match may exist by chance in noise, but never a *good* one.
+        if result is not None:
+            self.assertGreater(result[0], 0.3)
+
+    def test_assign_shift_plans_only_targets_donor_free_runs(self):
+        from epicat.bandscan import Run
+        from epicat.config import SubtitleBandConfig
+        run_with_donor = Run(start=0, end=10, donor_before=0)
+        run_without = Run(start=20, end=30)
+        cfg = SubtitleBandConfig()
+        self.assertEqual(run_with_donor.shift_plan, [])
+        self.assertEqual(run_without.shift_plan, [])
+        self.assertTrue(cfg.texture_fill)   # on by default
+
+    def test_plan_for_mask_covers_repeating_texture(self):
+        from epicat.bandscan import _plan_for_mask
+        from epicat.config import SubtitleBandConfig
+        img = self._striped_image()
+        mask = np.zeros(img.shape[:2], dtype=bool)
+        mask[20:40, 100:120] = True
+        cfg = SubtitleBandConfig()
+        plan = _plan_for_mask(img, mask, cfg)
+        self.assertGreater(len(plan), 0)
+
+    def test_apply_shift_plan_self_consistency(self):
+        # The exact regression this guards: a plan searched with best_shift()
+        # (quality = MSE / ring-variance) used to be re-validated at render
+        # time against donor_match_tolerance -- an unrelated, differently-
+        # scaled threshold from the donor-patching code path -- so every
+        # chunk was rejected, even on the very frame the plan came from.
+        from epicat.bandscan import _plan_for_mask
+        from epicat.config import SubtitleBandConfig
+        from epicat.clean import _apply_shift_plan
+        img = self._striped_image()
+        mask = np.zeros(img.shape[:2], dtype=bool)
+        mask[20:40, 100:120] = True
+        cfg = SubtitleBandConfig()
+        plan = _plan_for_mask(img, mask, cfg)
+        self.assertGreater(len(plan), 0)
+        _, covered = _apply_shift_plan(img, mask, plan, cfg)
+        self.assertTrue(covered.any(),
+                        "a plan must validate against the exact frame it was planned from")
+
+    def test_apply_shift_plan_rejects_content_that_no_longer_matches(self):
+        from epicat.bandscan import ChunkShift
+        from epicat.config import SubtitleBandConfig
+        from epicat.clean import _apply_shift_plan
+        img = self._striped_image()
+        mask = np.zeros(img.shape[:2], dtype=bool)
+        mask[20:40, 100:120] = True
+        # A shift that does NOT land on the repeat period points at content
+        # that looks nothing like the hole's surroundings.
+        bogus = [ChunkShift(box=(15, 45, 95, 125), dy=0, dx=7)]
+        cfg = SubtitleBandConfig()
+        out, covered = _apply_shift_plan(img, mask, bogus, cfg)
+        self.assertFalse(covered.any())
+
+    def test_apply_shift_plan_out_of_bounds_offset_is_skipped_not_crashed(self):
+        from epicat.bandscan import ChunkShift
+        from epicat.config import SubtitleBandConfig
+        from epicat.clean import _apply_shift_plan
+        img = self._striped_image()
+        mask = np.zeros(img.shape[:2], dtype=bool)
+        mask[20:40, 100:120] = True
+        way_off = [ChunkShift(box=(15, 45, 95, 125), dy=0, dx=10_000)]
+        cfg = SubtitleBandConfig()
+        out, covered = _apply_shift_plan(img, mask, way_off, cfg)
+        self.assertFalse(covered.any())
+        self.assertEqual(out.shape, img.shape)
+
+
 if __name__ == "__main__":
     unittest.main()
